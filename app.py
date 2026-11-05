@@ -1,30 +1,48 @@
-import os, json, sqlite3, secrets, time, base64, uuid
+import os, json, secrets, time, base64, uuid
+import psycopg
+from psycopg.rows import dict_row
 from pathlib import Path
 from functools import wraps
 from flask import Flask, request, jsonify, session, send_from_directory, abort
 from werkzeug.security import generate_password_hash, check_password_hash
 
 BASE=Path(__file__).resolve().parent
-DB=Path(os.environ.get('ADOPTION_DB', str(BASE/'adoption.sqlite3')))
 app=Flask(__name__,static_folder='static',static_url_path='/static')
 secret=os.environ.get('APP_SECRET_KEY')
 if not secret:
-    raise RuntimeError('APP_SECRET_KEY 환경변수를 설정하세요. README 참조')
+    raise RuntimeError('APP_SECRET_KEY 환경변수를 설정하세요.')
 app.secret_key=secret
 app.config.update(SESSION_COOKIE_HTTPONLY=True,SESSION_COOKIE_SAMESITE='Lax',SESSION_COOKIE_SECURE=os.environ.get('COOKIE_SECURE','1')=='1',MAX_CONTENT_LENGTH=7*1024*1024)
 FAIL={}
-def connect():
-    c=sqlite3.connect(DB);c.row_factory=sqlite3.Row;c.execute('PRAGMA busy_timeout=5000');return c
+
+# A small compatibility wrapper keeps the existing SQL parameter syntax and endpoints.
+class Database:
+    def __init__(self):
+        url=os.environ.get('DATABASE_URL')
+        if not url: raise RuntimeError('Render Environment에 DATABASE_URL을 설정하세요.')
+        self.conn=psycopg.connect(url, row_factory=dict_row, connect_timeout=15)
+    def __enter__(self): return self
+    def __exit__(self,typ,val,tb):
+        try:
+            if typ: self.conn.rollback()
+            else: self.conn.commit()
+        finally: self.conn.close()
+    def execute(self,sql,params=None):
+        sql=sql.replace('?', '%s').replace('ORDER BY rowid','ORDER BY id')
+        return self.conn.execute(sql,params)
+    def executemany(self,sql,params):
+        return self.conn.executemany(sql.replace('?','%s'),params)
+
+def connect():return Database()
 
 def init_db():
-    DB.parent.mkdir(parents=True,exist_ok=True)
     with connect() as c:
         c.execute('CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)')
         c.execute('CREATE TABLE IF NOT EXISTS cats (id TEXT PRIMARY KEY, name TEXT NOT NULL, age TEXT, sex TEXT, personality TEXT, neuter TEXT, status TEXT, visible INTEGER, photo TEXT)')
-        c.execute('CREATE TABLE IF NOT EXISTS applications (id TEXT PRIMARY KEY, name TEXT NOT NULL, cat TEXT, date TEXT, time TEXT, note TEXT, status TEXT, answers TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP)')
+        c.execute('CREATE TABLE IF NOT EXISTS applications (id TEXT PRIMARY KEY, name TEXT NOT NULL, cat TEXT, date TEXT, time TEXT, note TEXT, status TEXT, answers TEXT, created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP)')
         if not c.execute("SELECT 1 FROM settings WHERE key='password_hash'").fetchone():
             pw=os.environ.get('INITIAL_ADMIN_PASSWORD','')
-            if len(pw)<12:raise RuntimeError('최초 실행 시 INITIAL_ADMIN_PASSWORD 12자 이상을 설정하세요')
+            if len(pw)<12:raise RuntimeError('INITIAL_ADMIN_PASSWORD를 12자 이상으로 설정하세요.')
             c.execute('INSERT INTO settings VALUES (?,?)',('password_hash',generate_password_hash(pw)))
             c.execute('INSERT INTO settings VALUES (?,?)',('password_version','1'))
         if not c.execute('SELECT 1 FROM cats').fetchone():
@@ -89,7 +107,7 @@ def change_password():
 @guard
 def admin_data():
     with connect() as c:
-        return jsonify(cats=[dict(r) for r in c.execute('SELECT * FROM cats ORDER BY rowid')],applications=[{**dict(r),'answers':json.loads(r['answers'])} for r in c.execute('SELECT * FROM applications ORDER BY created_at DESC')])
+        return jsonify(cats=[dict(r) for r in c.execute('SELECT * FROM cats ORDER BY id')],applications=[{**dict(r),'answers':json.loads(r['answers'])} for r in c.execute('SELECT * FROM applications ORDER BY created_at DESC')])
 
 @app.post('/api/admin/cats')
 @guard
