@@ -28,12 +28,13 @@ class Database:
             else: self.conn.commit()
         finally: self.conn.close()
     def execute(self,sql,params=None):
-        sql=sql.replace('?', '%s').replace('ORDER BY rowid','ORDER BY id')
+        sql=sql.replace('?','%s').replace('ORDER BY rowid','ORDER BY id')
         return self.conn.execute(sql,params)
     def executemany(self,sql,params):
-    with self.conn.cursor() as cur:
-        cur.executemany(sql.replace('?','%s'),params)
-    return self
+        with self.conn.cursor() as cur:
+            cur.executemany(sql.replace('?','%s'),params)
+        return self
+
     
 def connect():return Database()
 
