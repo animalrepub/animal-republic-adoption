@@ -31,8 +31,10 @@ class Database:
         sql=sql.replace('?', '%s').replace('ORDER BY rowid','ORDER BY id')
         return self.conn.execute(sql,params)
     def executemany(self,sql,params):
-        return self.conn.executemany(sql.replace('?','%s'),params)
-
+    with self.conn.cursor() as cur:
+        cur.executemany(sql.replace('?','%s'),params)
+    return self
+    
 def connect():return Database()
 
 def init_db():
