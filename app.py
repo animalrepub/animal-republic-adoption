@@ -1,4 +1,7 @@
-import os, json, secrets, time, base64, uuid
+import os, json, secrets, time, base64, uuid, re, smtplib, ssl, logging
+from datetime import datetime, date, timedelta
+from zoneinfo import ZoneInfo
+from email.message import EmailMessage
 import psycopg
 from psycopg.rows import dict_row
 from pathlib import Path
@@ -43,6 +46,12 @@ def init_db():
         c.execute('CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)')
         c.execute('CREATE TABLE IF NOT EXISTS cats (id TEXT PRIMARY KEY, name TEXT NOT NULL, age TEXT, sex TEXT, personality TEXT, neuter TEXT, status TEXT, visible INTEGER, photo TEXT)')
         c.execute('CREATE TABLE IF NOT EXISTS applications (id TEXT PRIMARY KEY, name TEXT NOT NULL, cat TEXT, date TEXT, time TEXT, note TEXT, status TEXT, answers TEXT, created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP)')
+        c.execute("CREATE TABLE IF NOT EXISTS booking_rules (id INTEGER PRIMARY KEY CHECK(id=1), weekdays TEXT NOT NULL, start_time TEXT NOT NULL, end_time TEXT NOT NULL, slot_minutes INTEGER NOT NULL DEFAULT 60)")
+        c.execute("INSERT INTO booking_rules(id,weekdays,start_time,end_time,slot_minutes) VALUES (1,'[0,1,2,3,4,5]','11:00','18:00',60) ON CONFLICT(id) DO NOTHING")
+        c.execute("CREATE TABLE IF NOT EXISTS booking_blocks (id TEXT PRIMARY KEY, date TEXT NOT NULL, start_time TEXT, end_time TEXT, reason TEXT NOT NULL DEFAULT '')")
+        c.execute("CREATE INDEX IF NOT EXISTS booking_blocks_date_idx ON booking_blocks(date)")
+        c.execute("CREATE TABLE IF NOT EXISTS application_notifications (application_id TEXT PRIMARY KEY REFERENCES applications(id) ON DELETE CASCADE, seen BOOLEAN NOT NULL DEFAULT FALSE, emailed BOOLEAN NOT NULL DEFAULT FALSE)")
+        c.execute("INSERT INTO application_notifications(application_id,seen,emailed) SELECT id,TRUE,FALSE FROM applications ON CONFLICT DO NOTHING")
         if not c.execute("SELECT 1 FROM settings WHERE key='password_hash'").fetchone():
             pw=os.environ.get('INITIAL_ADMIN_PASSWORD','')
             if len(pw)<12:raise RuntimeError('INITIAL_ADMIN_PASSWORD를 12자 이상으로 설정하세요.')
@@ -110,7 +119,7 @@ def change_password():
 @guard
 def admin_data():
     with connect() as c:
-        return jsonify(cats=[dict(r) for r in c.execute('SELECT * FROM cats ORDER BY id')],applications=[{**dict(r),'answers':json.loads(r['answers'])} for r in c.execute('SELECT * FROM applications ORDER BY created_at DESC')])
+        return jsonify(cats=[dict(r) for r in c.execute('SELECT * FROM cats ORDER BY id')],applications=[{**dict(r),'answers':json.loads(r['answers']),'seen':r['seen'] if r['seen'] is not None else True} for r in c.execute('SELECT a.*,n.seen FROM applications a LEFT JOIN application_notifications n ON n.application_id=a.id ORDER BY a.created_at DESC')])
 
 @app.post('/api/admin/cats')
 @guard
@@ -135,14 +144,116 @@ def delete_cat(id):
     with connect() as c:c.execute('DELETE FROM cats WHERE id=?',(id,))
     return jsonify(ok=True)
 
+# Booking times are interpreted in Asia/Seoul, regardless of the Render server timezone.
+TZ=ZoneInfo('Asia/Seoul')
+TIME_RE=re.compile(r'^([01]\d|2[0-3]):(00|30)$')
+def valid_time(v):return isinstance(v,str) and bool(TIME_RE.fullmatch(v))
+def minute(v):return int(v[:2])*60+int(v[3:])
+def rules(c):
+    r=c.execute('SELECT * FROM booking_rules WHERE id=1').fetchone()
+    return {'weekdays':json.loads(r['weekdays']),'start_time':r['start_time'],'end_time':r['end_time'],'slot_minutes':60}
+def parse_day(value):
+    try:
+        if not isinstance(value,str) or not re.fullmatch(r'\d{4}-\d{2}-\d{2}',value):return None
+        return date.fromisoformat(value)
+    except ValueError:return None
+def open_slots(c,day):
+    cfg=rules(c)
+    if day.weekday() not in cfg['weekdays'] or day<datetime.now(TZ).date() or day>datetime.now(TZ).date()+timedelta(days=180):return []
+    blocks=list(c.execute('SELECT * FROM booking_blocks WHERE date=?',(day.isoformat(),)))
+    reserved={r['time'] for r in c.execute("SELECT time FROM applications WHERE date=? AND status IN ('승인 대기','승인 완료')",(day.isoformat(),))}
+    now=datetime.now(TZ)
+    slots=[]
+    for m in range(minute(cfg['start_time']),minute(cfg['end_time'])-59,60):
+        tm=f'{m//60:02d}:{m%60:02d}'
+        if tm in reserved:continue
+        if day==now.date() and m<=now.hour*60+now.minute:continue
+        if any(b['start_time'] is None or (m<minute(b['end_time']) and m+60>minute(b['start_time'])) for b in blocks):continue
+        slots.append(tm)
+    return slots
+
+@app.get('/api/booking/availability')
+def booking_availability():
+    d=parse_day(request.args.get('date',''))
+    if not d:return jsonify(error='날짜를 확인해 주세요.'),400
+    with connect() as c:return jsonify(date=d.isoformat(),slots=open_slots(c,d))
+
+@app.get('/api/booking/rules')
+def public_booking_rules():
+    with connect() as c:return jsonify(rules(c))
+
+@app.get('/api/admin/booking')
+@guard
+def admin_booking():
+    with connect() as c:
+        return jsonify(rules=rules(c),blocks=[dict(x) for x in c.execute('SELECT * FROM booking_blocks ORDER BY date,start_time')])
+
+@app.put('/api/admin/booking/rules')
+@guard
+def save_booking_rules():
+    d=request.get_json(silent=True) or {};wd=d.get('weekdays');start=d.get('start_time');end=d.get('end_time')
+    if not isinstance(wd,list) or not wd or any(type(x)!=int or x not in range(7) for x in wd) or len(set(wd))!=len(wd):return jsonify(error='상담 요일을 확인해 주세요.'),400
+    if not valid_time(start) or not valid_time(end) or minute(end)-minute(start)<60 or minute(start)%60 or minute(end)%60:return jsonify(error='시간은 정각 기준으로 1시간 이상 설정해 주세요.'),400
+    with connect() as c:c.execute('UPDATE booking_rules SET weekdays=?,start_time=?,end_time=?,slot_minutes=60 WHERE id=1',(json.dumps(sorted(wd)),start,end))
+    return jsonify(ok=True)
+
+@app.post('/api/admin/booking/blocks')
+@guard
+def add_booking_block():
+    d=request.get_json(silent=True) or {};day=parse_day(d.get('date'));start=d.get('start_time') or None;end=d.get('end_time') or None
+    if not day or day<datetime.now(TZ).date() or day>datetime.now(TZ).date()+timedelta(days=365):return jsonify(error='차단 날짜를 확인해 주세요.'),400
+    if (start is None)!=(end is None) or (start is not None and (not valid_time(start) or not valid_time(end) or minute(end)<=minute(start))):return jsonify(error='차단 시간 범위를 확인해 주세요.'),400
+    with connect() as c:c.execute('INSERT INTO booking_blocks(id,date,start_time,end_time,reason) VALUES(?,?,?,?,?)',(uuid.uuid4().hex,day.isoformat(),start,end,str(d.get('reason',''))[:200]))
+    return jsonify(ok=True)
+
+@app.delete('/api/admin/booking/blocks/<block_id>')
+@guard
+def delete_booking_block(block_id):
+    with connect() as c:c.execute('DELETE FROM booking_blocks WHERE id=?',(block_id,))
+    return jsonify(ok=True)
+
+@app.post('/api/admin/applications/<application_id>/seen')
+@guard
+def mark_application_seen(application_id):
+    with connect() as c:c.execute('UPDATE application_notifications SET seen=TRUE WHERE application_id=?',(application_id,))
+    return jsonify(ok=True)
+
+def send_application_email(application_id,day,tm):
+    host=os.environ.get('SMTP_HOST','');sender=os.environ.get('SMTP_FROM','');recipient=os.environ.get('ADMIN_NOTIFY_EMAIL','');username=os.environ.get('SMTP_USER','');password=os.environ.get('SMTP_PASSWORD','')
+    if not all((host,sender,recipient,username,password)):return False
+    try:
+        port=int(os.environ.get('SMTP_PORT','465'))
+        msg=EmailMessage();msg['Subject']='[애니멀공화국] 새 입양 상담 신청';msg['From']=sender;msg['To']=recipient
+        msg.set_content(f'새 입양 상담 신청이 접수되었습니다.\n희망 일정: {day} {tm}\n신청서와 개인정보는 관리자 페이지에서 확인해 주세요.\nhttps://animal-republic-adoption.onrender.com/')
+        if port==465:
+            with smtplib.SMTP_SSL(host,port,timeout=10,context=ssl.create_default_context()) as server:
+                server.login(username,password);server.send_message(msg)
+        else:
+            with smtplib.SMTP(host,port,timeout=10) as server:
+                server.starttls(context=ssl.create_default_context());server.login(username,password);server.send_message(msg)
+        return True
+    except Exception:
+        app.logger.exception('상담 신청 이메일 발송 실패')
+        return False
+
 @app.post('/api/applications')
 def apply():
     d=request.get_json(silent=True) or {};a=d.get('answers') or {};date=d.get('date','');tm=d.get('time','')
     if not isinstance(a,dict) or not str(a.get('2','')).strip() or not str(a.get('4','')).strip() or not date or not tm:return jsonify(error='필수 설문과 상담 희망 일정을 입력해 주세요.'),400
     if len(json.dumps(a,ensure_ascii=False))>20000:return jsonify(error='설문 입력이 너무 깁니다.'),400
     if a.get('1')!='동의 합니다.':return jsonify(error='개인정보 수집·이용 동의가 필요합니다.'),400
+    day=parse_day(date)
+    if not day or not isinstance(tm,str):return jsonify(error='상담 날짜와 시간을 확인해 주세요.'),400
+    application_id=uuid.uuid4().hex
     with connect() as c:
-        c.execute('INSERT INTO applications(id,name,cat,date,time,note,status,answers) VALUES(?,?,?,?,?,?,?,?)',(uuid.uuid4().hex,str(a['2'])[:80],str(a.get('19',''))[:80],str(date)[:20],str(tm)[:10],str(d.get('note',''))[:2000],'승인 대기',json.dumps(a,ensure_ascii=False)))
+        # Serialize booking writes across all app workers; prevent concurrent double bookings.
+        c.execute('SELECT pg_advisory_xact_lock(hashtext(?))',('animal-republic-booking-'+day.isoformat(),))
+        if tm not in open_slots(c,day):return jsonify(error='선택한 시간이 예약 불가 또는 이미 신청된 시간입니다. 다른 시간을 선택해 주세요.'),409
+        c.execute('INSERT INTO applications(id,name,cat,date,time,note,status,answers) VALUES(?,?,?,?,?,?,?,?)',(application_id,str(a['2'])[:80],str(a.get('19',''))[:80],day.isoformat(),tm,str(d.get('note',''))[:2000],'승인 대기',json.dumps(a,ensure_ascii=False)))
+        c.execute('INSERT INTO application_notifications(application_id,seen,emailed) VALUES (?,FALSE,FALSE)',(application_id,))
+    emailed=send_application_email(application_id,day.isoformat(),tm)
+    if emailed:
+        with connect() as c:c.execute('UPDATE application_notifications SET emailed=TRUE WHERE application_id=?',(application_id,))
     return jsonify(ok=True,message='상담 신청이 접수되었습니다. 예약은 관리자 확인 후 확정됩니다.')
 
 @app.patch('/api/admin/applications/<id>')
