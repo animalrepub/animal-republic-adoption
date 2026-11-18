@@ -24,6 +24,11 @@
 
 
 let cats=[],applications=[],admin=false,csrf='',tab='home',answers={},step=0,review=false,booking={date:'',time:'',note:''};
+let adminApplicationFilter='new',adminApplicationPage=1,adminApplicationQuery='';
+const ADMIN_PAGE_SIZE=10;
+const SCHEDULED_STATUSES=['승인 대기','승인 완료'];
+const APPLICATION_STATUSES=[...SCHEDULED_STATUSES,'상담 완료','취소'];
+const pendingApplicationStatuses=new Set();
 const app=document.getElementById('app'),tabs=document.getElementById('tabs');
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 async function api(path,method='GET',data){let r=await fetch('/api/'+path,{method,headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},body:data===undefined?undefined:JSON.stringify(data),credentials:'same-origin'});let j=await r.json();if(!r.ok){if(r.status===401){admin=false;if(tab==='admin')renderAdmin()}throw new Error(j.error||'요청을 처리하지 못했습니다.')}return j}
@@ -46,10 +51,65 @@ dateEl.onchange=()=>{booking.date=dateEl.value;booking.time='';loadSlots()};if(d
 document.getElementById('submit').onclick=async()=>{booking={date:dateEl.value,time:timeEl.value,note:document.getElementById('note').value};let err=document.getElementById('error');if(!booking.date||!booking.time){err.textContent='예약 가능한 날짜와 시간을 선택해 주세요.';return}if(!answers[2]||!answers[4]||!review){err.textContent='먼저 사전 설문을 끝까지 작성해 주세요.';return}let btn=document.getElementById('submit');btn.disabled=true;try{let d=await api('applications','POST',{...booking,answers});app.innerHTML=`<section class="card"><h2>상담 신청 접수 완료 ✓</h2><p>${esc(d.message)}</p><p>희망 일정: ${esc(booking.date+' '+booking.time)}</p><button id="goHome">홈으로</button></section>`;document.getElementById('goHome').onclick=()=>{answers={};review=false;step=0;setTab('home')}}catch(e){err.textContent=e.message;btn.disabled=false;await loadSlots()}}}
 async function renderAdmin(){if(!admin){app.innerHTML=`<section class="card"><h2>관리자 전용 비밀번호</h2><p>공통 비밀번호를 입력하면 관리자 페이지에 접근할 수 있습니다. 비밀번호를 변경하면 모든 기기에 즉시 적용됩니다.</p><div class="field"><label>관리자 비밀번호</label><input type="password" id="adminPass" autocomplete="current-password"></div><p class="error" id="passError"></p><button id="unlock">관리자 페이지 들어가기</button></section>`;document.getElementById('unlock').onclick=async()=>{try{let d=await api('admin/unlock','POST',{password:document.getElementById('adminPass').value});csrf=d.csrf;admin=true;renderAdmin()}catch(e){document.getElementById('passError').textContent=e.message}};return}
 let data;try{data=await api('admin/data')}catch(e){app.innerHTML=`<section class="card">${esc(e.message)}</section>`;return}applications=data.applications;
-app.innerHTML=`<section class="card"><h2>관리자 대시보드</h2><div class="row"><button class="secondary" id="lock">관리자 잠그기</button><button class="secondary" id="changePass">공통 비밀번호 변경</button></div><p class="muted">서버에 저장된 고양이와 신청 목록입니다. 비밀번호 변경 시 다른 직원도 새 비밀번호를 사용해야 합니다.</p></section><section class="card"><h3>상담 신청 목록 (${applications.length}) · 미확인 ${applications.filter(a=>!a.seen).length}건</h3>${applications.length?`<div style="overflow:auto"><table><thead><tr><th>신청자</th><th>고양이</th><th>희망 일정</th><th>상태</th><th>관리</th></tr></thead><tbody>${applications.map(a=>`<tr><td>${a.seen?'':'🔔 '}${esc(a.name)}</td><td>${esc(a.cat)}</td><td>${esc(a.date+' '+a.time)}</td><td>${esc(a.status)}</td><td><select data-status="${esc(a.id)}">${['승인 대기','승인 완료','상담 완료','취소'].map(s=>`<option ${s===a.status?'selected':''}>${s}</option>`).join('')}</select><button class="secondary" data-detail="${esc(a.id)}">설문 보기 / 확인</button></td></tr>`).join('')}</tbody></table></div>`:'<p>접수된 상담 신청이 없습니다.</p>'}<div id="detail"></div></section><section class="card" id="bookingManager"><h3>상담 일정 관리</h3><p class="muted">상담 가능 요일·시간 및 날짜별 차단을 설정합니다. 기존 예약은 자동 취소되지 않습니다.</p><div id="bookingManagerBody">불러오는 중…</div></section><section class="card"><h3>고양이 프로필 관리</h3><button id="newCat">+ 고양이 등록</button><div class="grid">${data.cats.map(c=>`<article class="miniCat"><img src="${c.photo||''}" alt="${esc(c.name)}"><div><b>${esc(c.name)}</b><p class="muted">${esc(c.age)} · ${esc(c.status)} · ${c.visible?'공개':'비공개'}</p><button class="secondary" data-edit="${esc(c.id)}">정보 수정</button> <button class="danger" data-delete="${esc(c.id)}">삭제</button></div></article>`).join('')}</div><div id="catEditor"></div></section>`;
+app.innerHTML=`<section class="card"><h2>관리자 대시보드</h2><div class="row"><button class="secondary" id="lock">관리자 잠그기</button><button class="secondary" id="changePass">공통 비밀번호 변경</button></div><p class="muted">서버에 저장된 고양이와 신청 목록입니다. 비밀번호 변경 시 다른 직원도 새 비밀번호를 사용해야 합니다.</p></section><section class="card" id="applicationsManager"><h3 id="applicationHeading">상담 신청 목록</h3><div class="field"><label for="applicationSearch">상담 신청 검색</label><input type="search" id="applicationSearch" placeholder="신청자, 고양이, 희망 일정 또는 상태" value="${esc(adminApplicationQuery)}"></div><div class="row" id="applicationFilters" style="margin:12px 0"></div><div id="applicationList"></div><div id="detail"></div></section><section class="card" id="bookingManager"><h3>상담 일정 관리</h3><p class="muted">상담 가능 요일·시간 및 날짜별 차단을 설정합니다. 기존 예약은 자동 취소되지 않습니다.</p><div id="bookingManagerBody">불러오는 중…</div></section><section class="card"><h3>고양이 프로필 관리</h3><button id="newCat">+ 고양이 등록</button><div class="grid">${data.cats.map(c=>`<article class="miniCat"><img src="${c.photo||''}" alt="${esc(c.name)}"><div><b>${esc(c.name)}</b><p class="muted">${esc(c.age)} · ${esc(c.status)} · ${c.visible?'공개':'비공개'}</p><button class="secondary" data-edit="${esc(c.id)}">정보 수정</button> <button class="danger" data-delete="${esc(c.id)}">삭제</button></div></article>`).join('')}</div><div id="catEditor"></div></section>`;
+document.getElementById('applicationSearch').oninput=e=>{
+ adminApplicationQuery=e.target.value;
+ adminApplicationPage=1;
+ document.getElementById('detail').textContent='';
+ renderApplicationList();
+};
+renderApplicationList();
 document.getElementById('lock').onclick=async()=>{let d=await api('admin/lock','POST',{});csrf=d.csrf;admin=false;setTab('home')};document.getElementById('changePass').onclick=()=>{let box=document.createElement('section');box.className='card';box.innerHTML=`<h3>공통 비밀번호 변경</h3><p>새 비밀번호는 12자 이상이어야 합니다. 변경 즉시 모든 직원의 기존 관리자 접근 권한이 만료됩니다.</p><div class="field"><label>현재 비밀번호</label><input id="oldPass" type="password"></div><div class="field"><label>새 비밀번호 (12자 이상)</label><input id="newPass" type="password"></div><div class="field"><label>새 비밀번호 확인</label><input id="newConfirm" type="password"></div><p id="changeError" class="error"></p><div class="row"><button id="savePass">변경 저장</button><button class="secondary" id="cancelPass">취소</button></div>`;app.prepend(box);document.getElementById('cancelPass').onclick=()=>box.remove();document.getElementById('savePass').onclick=async()=>{let old=document.getElementById('oldPass').value,now=document.getElementById('newPass').value;if(now!==document.getElementById('newConfirm').value){document.getElementById('changeError').textContent='새 비밀번호가 일치하지 않습니다.';return}try{let d=await api('admin/password','POST',{old,new:now});csrf=d.csrf;admin=false;alert(d.message);renderAdmin()}catch(e){document.getElementById('changeError').textContent=e.message}}};
-app.querySelectorAll('[data-status]').forEach(el=>el.onchange=async()=>{try{await api('admin/applications/'+encodeURIComponent(el.dataset.status),'PATCH',{status:el.value});renderAdmin()}catch(e){alert(e.message)}});app.querySelectorAll('[data-detail]').forEach(b=>b.onclick=()=>{let a=applications.find(x=>x.id===b.dataset.detail);api('admin/applications/'+encodeURIComponent(a.id)+'/seen','POST',{}).then(()=>{a.seen=true}).catch(()=>{});document.getElementById('detail').innerHTML=`<h3>${esc(a.name)} · 설문 답변</h3><div class="summary">${questions.filter(q=>!q.when||q.when(a.answers)).map(q=>esc(q.id+'. '+q.q+'\n'+(Array.isArray(a.answers[q.id])?a.answers[q.id].join(', '):a.answers[q.id]||'(미입력)'))).join('\n\n')}</div>`});
 loadBookingManager();document.getElementById('newCat').onclick=()=>showCatEditor(null);app.querySelectorAll('[data-edit]').forEach(b=>b.onclick=()=>showCatEditor(data.cats.find(c=>c.id===b.dataset.edit)));app.querySelectorAll('[data-delete]').forEach(b=>b.onclick=async()=>{if(confirm('정말 삭제하시겠습니까? 기록 보존을 위해 비공개 처리를 권장합니다.')){try{await api('admin/cats/'+encodeURIComponent(b.dataset.delete),'DELETE');await refresh();renderAdmin()}catch(e){alert(e.message)}}})}
+function renderApplicationList(){
+ const filters=document.getElementById('applicationFilters'),list=document.getElementById('applicationList'),detail=document.getElementById('detail');
+ if(!filters||!list)return;
+ const counts={new:applications.filter(a=>!a.seen).length,scheduled:applications.filter(a=>SCHEDULED_STATUSES.includes(a.status)).length,all:applications.length};
+ document.getElementById('applicationHeading').textContent=`상담 신청 목록 (${counts.all}) · 미확인 ${counts.new}건`;
+ const names={new:'신규',scheduled:'상담 예정',all:'전체'};
+ filters.innerHTML=Object.keys(names).map(k=>`<button type="button" class="${adminApplicationFilter===k?'':'secondary'}" data-app-filter="${k}" aria-pressed="${adminApplicationFilter===k}">${names[k]} (${counts[k]})</button>`).join('');
+ filters.querySelectorAll('[data-app-filter]').forEach(b=>b.onclick=()=>{adminApplicationFilter=b.dataset.appFilter;adminApplicationPage=1;detail.innerHTML='';renderApplicationList()});
+ let rows=applications.filter(a=>adminApplicationFilter==='new'?!a.seen:adminApplicationFilter==='scheduled'?SCHEDULED_STATUSES.includes(a.status):true);
+ const terms=adminApplicationQuery.trim().toLowerCase().split(/\s+/).filter(Boolean);
+ rows=rows.filter(a=>{
+  const searchable=[a.name,a.cat,a.date,a.time,a.status].join(' ').toLowerCase();
+  return terms.every(term=>searchable.includes(term));
+ });
+ // The API returns newest first. Keep that order within each group.
+ if(adminApplicationFilter==='all')rows=[...rows.filter(a=>!a.seen),...rows.filter(a=>a.seen)];
+ const pages=Math.max(1,Math.ceil(rows.length/ADMIN_PAGE_SIZE));adminApplicationPage=Math.min(Math.max(1,adminApplicationPage),pages);
+ const offset=(adminApplicationPage-1)*ADMIN_PAGE_SIZE,visible=rows.slice(offset,offset+ADMIN_PAGE_SIZE);
+ list.innerHTML=visible.length?`<div style="overflow:auto"><table><thead><tr><th>신청자</th><th>고양이</th><th>희망 일정</th><th>상태</th><th>관리</th></tr></thead><tbody>${visible.map(a=>`<tr><td>${a.seen?'':'🔔 '}${esc(a.name)}</td><td>${esc(a.cat)}</td><td>${esc(a.date+' '+a.time)}</td><td>${esc(a.status)}</td><td><select data-status="${esc(a.id)}" ${pendingApplicationStatuses.has(a.id)?'disabled':''} aria-label="${esc(a.name)} 상담 상태">${APPLICATION_STATUSES.map(s=>`<option ${s===a.status?'selected':''}>${s}</option>`).join('')}</select><button class="secondary" data-detail="${esc(a.id)}">설문 보기 / 확인</button></td></tr>`).join('')}</tbody></table></div>`:`<p class="muted">${terms.length?'검색 조건에 맞는 상담 신청이 없습니다.':'이 탭에 해당하는 상담 신청이 없습니다.'}</p>`;
+ list.innerHTML+=`<div class="row" style="justify-content:space-between;margin-top:14px"><span class="muted">총 ${rows.length}건 · ${adminApplicationPage}/${pages} 페이지</span><div class="row"><button type="button" class="secondary" id="appPrev" ${adminApplicationPage<=1?'disabled':''}>이전</button><button type="button" class="secondary" id="appNext" ${adminApplicationPage>=pages?'disabled':''}>다음</button></div></div>`;
+ document.getElementById('appPrev').onclick=()=>{adminApplicationPage--;detail.innerHTML='';renderApplicationList()};
+ document.getElementById('appNext').onclick=()=>{adminApplicationPage++;detail.innerHTML='';renderApplicationList()};
+ list.querySelectorAll('[data-status]').forEach(el=>el.onchange=async()=>{
+  const a=applications.find(x=>x.id===el.dataset.status);
+  const status=el.value;
+  pendingApplicationStatuses.add(a.id);
+  el.disabled=true;
+  try{
+   await api('admin/applications/'+encodeURIComponent(a.id),'PATCH',{status});
+   const current=applications.find(x=>x.id===a.id);
+   if(current)current.status=status;
+  }catch(e){
+   alert(e.message);
+  }finally{
+   pendingApplicationStatuses.delete(a.id);
+   renderApplicationList();
+  }
+ });
+ list.querySelectorAll('[data-detail]').forEach(b=>b.onclick=async()=>{const a=applications.find(x=>x.id===b.dataset.detail);if(!a)return;
+ detail.innerHTML=`<h3>${esc(a.name)} · 설문 답변</h3><div class="summary">${questions.filter(q=>!q.when||q.when(a.answers)).map(q=>esc(q.id+'. '+q.q+'\n'+(Array.isArray(a.answers[q.id])?a.answers[q.id].join(', '):a.answers[q.id]||'(미입력)'))).join('\n\n')}</div>`;
+  if(a.seen)return;
+ try{
+  await api('admin/applications/'+encodeURIComponent(a.id)+'/seen','POST',{});
+  const current=applications.find(x=>x.id===a.id);
+  if(current)current.seen=true;
+  renderApplicationList();
+ }catch(e){alert('확인 상태를 저장하지 못했습니다: '+e.message)}
+ });
+}
 async function loadBookingManager(){let el=document.getElementById('bookingManagerBody');if(!el)return;try{let d=await api('admin/booking');let r=d.rules;el.innerHTML=`<div class="field"><label>상담 가능 요일</label><div class="row">${['월','화','수','목','금','토','일'].map((x,i)=>`<label class="choice" style="padding:8px"><input type="checkbox" data-weekday="${i}" ${r.weekdays.includes(i)?'checked':''}>${x}</label>`).join('')}</div></div><div class="grid"><div class="field"><label>시작 시간</label><select id="ruleStart">${Array.from({length:13},(_,i)=>`${String(i+7).padStart(2,'0')}:00`).map(t=>`<option ${t===r.start_time?'selected':''}>${t}</option>`).join('')}</select></div><div class="field"><label>종료 시간</label><select id="ruleEnd">${Array.from({length:15},(_,i)=>`${String(i+9).padStart(2,'0')}:00`).map(t=>`<option ${t===r.end_time?'selected':''}>${t}</option>`).join('')}</select></div></div><p class="muted">예약은 60분 단위로 제공됩니다.</p><button id="saveRules">운영시간 저장</button><div class="editor"><h4>상담 불가 날짜 / 시간 추가</h4><div class="grid"><div class="field"><label>날짜</label><input id="blockDate" type="date"></div><div class="field"><label>차단 방식</label><select id="blockType"><option value="all">하루 전체</option><option value="part">일부 시간</option></select></div><div class="field" id="blockStartBox" style="display:none"><label>시작</label><input id="blockStart" type="time" step="1800" value="14:00"></div><div class="field" id="blockEndBox" style="display:none"><label>종료</label><input id="blockEnd" type="time" step="1800" value="16:00"></div></div><div class="field"><label>차단 사유</label><input id="blockReason" type="text" placeholder="휴무, 행사, 내부 일정"></div><button id="addBlock">차단 일정 추가</button><h4>등록된 차단 일정</h4>${d.blocks.length?d.blocks.map(b=>`<div class="row" style="margin:8px 0"><span>${esc(b.date)} · ${b.start_time?esc(b.start_time+'~'+b.end_time):'종일'} · ${esc(b.reason)}</span><button class="secondary" data-remove-block="${esc(b.id)}">삭제</button></div>`).join(''):'<p class="muted">등록된 차단 일정이 없습니다.</p>'}</div>`;
 document.getElementById('blockType').onchange=e=>{let show=e.target.value==='part';document.getElementById('blockStartBox').style.display=show?'':'none';document.getElementById('blockEndBox').style.display=show?'':'none'};
 document.getElementById('saveRules').onclick=async()=>{try{await api('admin/booking/rules','PUT',{weekdays:[...el.querySelectorAll('[data-weekday]:checked')].map(x=>Number(x.dataset.weekday)),start_time:document.getElementById('ruleStart').value,end_time:document.getElementById('ruleEnd').value});alert('상담 운영시간을 저장했습니다.')}catch(e){alert(e.message)}};
